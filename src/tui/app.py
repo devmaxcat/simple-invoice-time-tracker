@@ -1,5 +1,7 @@
 from datetime import timedelta
 from pathlib import Path
+import shlex
+import subprocess
 import sys
 import termios
 import tty
@@ -32,9 +34,9 @@ class App:
         self.pay_period_length_days = 14
         self.hours_worked = 0.0
         self.hourly_rate = float(self.settings.get("default_rate", 18.0))
-        self.submission_date = get_today_date()
+        self.submission_date = None
         self.days_until_due = int(self.settings.get("default_days_until_due", 7))
-        self.due_date = self.submission_date + timedelta(days=self.days_until_due)
+        self.due_date = None
         self.work_notes = ""
         self.is_running = True
 
@@ -172,9 +174,9 @@ class App:
         period_start, period_end = self._current_period_range()
         self.hours_worked = 0.0
         self.hourly_rate = float(self.settings.get("default_rate", 18.0))
-        self.submission_date = period_end
+        self.submission_date = None
         self.days_until_due = int(self.settings.get("default_days_until_due", 7))
-        self.due_date = self.submission_date + timedelta(days=self.days_until_due)
+        self.due_date = None
         self.work_notes = ""
         self.edit_invoice_menu()
 
@@ -193,7 +195,7 @@ class App:
                         "Set Days Until Due",
                         "Work Notes",
                         "Preview Invoice",
-                        "Save + Generate PDF",
+                        "Save",
                         "Back to Main Menu",
                     ],
                     summary_rows=[
@@ -203,9 +205,9 @@ class App:
                         ("Hours", f"{self.hours_worked:.2f}"),
                         ("Rate", format_currency(self.hourly_rate)),
                         ("Total", format_currency(self.hours_worked * self.hourly_rate)),
-                        ("Submission", format_date(self.submission_date)),
+                        ("Submission", self._display_date(self.submission_date)),
                         ("Days Until Due", str(self.days_until_due)),
-                        ("Due", format_date(self.due_date)),
+                        ("Due", self._display_date(self.due_date)),
                     ],
                     subtitle="↑/↓ navigate • Enter select • 1-9 quick select",
                 )
@@ -230,12 +232,25 @@ class App:
             elif choice == "7":
                 self.show_invoice_preview_screen()
             elif choice == "8":
-                self.generate_and_save_invoice()
+                did_save = self.generate_and_save_invoice()
+                if did_save:
+                    self.open_existing_invoice()
+                    return
             elif choice == "9":
                 return
 
     def _pause(self):
         Prompt.ask("Press Enter to continue", default="")
+
+    def _display_date(self, date_value):
+        if date_value is None:
+            return "-"
+        return format_date(date_value)
+
+    def _serialize_date(self, date_value):
+        if date_value is None:
+            return ""
+        return format_date(date_value)
 
     def _screen_header(self, title, content_lines=10):
         panel = Panel(
@@ -284,7 +299,7 @@ class App:
                 self.console.print("Period length must be a positive integer.", style="bold red")
 
         period_start, period_end = self._current_period_range()
-        if self.submission_date < period_start or self.submission_date > period_end:
+        if self.submission_date is not None and (self.submission_date < period_start or self.submission_date > period_end):
             self.submission_date = period_end
             self.due_date = self.submission_date + timedelta(days=self.days_until_due)
 
@@ -324,11 +339,15 @@ class App:
         self.console.clear()
         self._screen_header("Set Submitted Date")
 
-        submission_default = format_date(self.submission_date)
+        submission_default = self._serialize_date(self.submission_date)
 
         while True:
-            submission_input = Prompt.ask("Submission date (YYYY-MM-DD, q to cancel)", default=submission_default)
+            submission_input = Prompt.ask("Submission date (YYYY-MM-DD, blank to clear, q to cancel)", default=submission_default)
             if submission_input.strip().lower() == "q":
+                return
+            if not submission_input.strip():
+                self.submission_date = None
+                self.due_date = None
                 return
             if is_valid_date(submission_input):
                 self.submission_date = parse_date(submission_input)
@@ -349,7 +368,8 @@ class App:
                 if days_until_due <= 0:
                     raise ValueError
                 self.days_until_due = days_until_due
-                self.due_date = self.submission_date + timedelta(days=self.days_until_due)
+                if self.submission_date is not None:
+                    self.due_date = self.submission_date + timedelta(days=self.days_until_due)
                 break
             except ValueError:
                 self.console.print("Days until due must be a positive integer.", style="bold red")
@@ -415,8 +435,7 @@ class App:
         if is_valid_date(submission_raw):
             self.submission_date = parse_date(submission_raw)
         else:
-            _, period_end = self._current_period_range()
-            self.submission_date = period_end
+            self.submission_date = None
 
         days_until_due = invoice_record.get("days_until_due", self.settings.get("default_days_until_due", 7))
         try:
@@ -429,7 +448,10 @@ class App:
         if is_valid_date(due_raw):
             self.due_date = parse_date(due_raw)
         else:
-            self.due_date = self.submission_date + timedelta(days=self.days_until_due)
+            if self.submission_date is not None:
+                self.due_date = self.submission_date + timedelta(days=self.days_until_due)
+            else:
+                self.due_date = None
 
         self.work_notes = str(invoice_record.get("work_notes", ""))
 
@@ -437,8 +459,8 @@ class App:
         timesheet = Timesheet(
             hours_worked=self.hours_worked,
             rate=self.hourly_rate,
-            submission_date=format_date(self.submission_date),
-            due_date=format_date(self.due_date),
+            submission_date=self._serialize_date(self.submission_date),
+            due_date=self._serialize_date(self.due_date),
             work_notes=self.work_notes,
         )
         return Invoice(
@@ -462,9 +484,9 @@ class App:
         preview.add_row("Hours", f"{self.hours_worked:.2f}")
         preview.add_row("Rate", format_currency(self.hourly_rate))
         preview.add_row("Total", format_currency(invoice.total_amount))
-        preview.add_row("Submission", format_date(self.submission_date))
+        preview.add_row("Submission", self._display_date(self.submission_date))
         preview.add_row("Days Until Due", str(self.days_until_due))
-        preview.add_row("Due", format_date(self.due_date))
+        preview.add_row("Due", self._display_date(self.due_date))
         preview.add_row("Notes", self.work_notes or "-")
 
         self.console.print(Align.center(Panel(preview, width=76, border_style="green", box=box.ROUNDED)))
@@ -480,9 +502,9 @@ class App:
             "hours_worked": self.hours_worked,
             "hourly_rate": self.hourly_rate,
             "total_amount": invoice.total_amount,
-            "submission_date": format_date(self.submission_date),
+            "submission_date": self._serialize_date(self.submission_date),
             "days_until_due": self.days_until_due,
-            "due_date": format_date(self.due_date),
+            "due_date": self._serialize_date(self.due_date),
             "work_notes": self.work_notes,
             "pdf_path": str(Path("invoices") / f"invoice_{invoice.invoice_number}.pdf"),
         }
@@ -586,9 +608,36 @@ class App:
 
                 live.update(build_renderable(selected_index, number_buffer, message), refresh=True)
 
+    def _open_pdf(self, pdf_path):
+        pdf_file = Path(str(pdf_path)).expanduser()
+        if not pdf_file.is_absolute():
+            pdf_file = Path.cwd() / pdf_file
+
+        if not pdf_file.exists():
+            raise FileNotFoundError(f"PDF file not found: {pdf_file}")
+
+        opener_setting = str(self.settings.get("pdf_open_command", "xdg-open")).strip()
+        if not opener_setting:
+            opener_setting = "xdg-open"
+
+        if "{pdf}" in opener_setting:
+            command = shlex.split(opener_setting.replace("{pdf}", str(pdf_file)))
+        else:
+            command = shlex.split(opener_setting) + [str(pdf_file)]
+
+        if not command:
+            raise ValueError("Invalid pdf_open_command setting.")
+
+        subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
     def generate_and_save_invoice(self):
         self.console.clear()
-        self._screen_header("Save + Generate Invoice")
+        self._screen_header("Save Invoice")
         invoice = self._build_invoice()
 
         try:
@@ -606,6 +655,7 @@ class App:
                     )
                 )
             )
+            return True
         except Exception as error:
             self.console.print(
                 Align.center(
@@ -617,8 +667,8 @@ class App:
                     )
                 )
             )
-
-        self._pause()
+            self._pause()
+            return False
 
     def open_existing_invoice(self):
         invoice_record = self._pick_existing_invoice()
@@ -652,7 +702,7 @@ class App:
                 action_index = self._arrow_menu_select(
                     menu_title="Actions",
                     summary_title="Tip",
-                    options=["Edit Invoice", "Regenerate PDF", "Back"],
+                    options=["Edit Invoice", "View PDF", "Regenerate PDF", "Back"],
                     summary_rows=[("Navigation", "↑/↓ then Enter")],
                     subtitle="Action menu • q back",
                     width=60,
@@ -662,12 +712,14 @@ class App:
                 if action_index == 0:
                     choice = "e"
                 elif action_index == 1:
+                    choice = "v"
+                elif action_index == 2:
                     choice = "r"
                 else:
                     choice = "b"
             else:
-                self.console.print(Align.center(Panel("[E]dit Invoice  [R]egenerate PDF  [B]ack", width=76, border_style="cyan", box=box.SIMPLE)))
-                choice = Prompt.ask("Action", choices=["e", "r", "b", "q"], default="b")
+                self.console.print(Align.center(Panel("[E]dit Invoice  [V]iew PDF  [R]egenerate PDF  [B]ack", width=76, border_style="cyan", box=box.SIMPLE)))
+                choice = Prompt.ask("Action", choices=["e", "v", "r", "b", "q"], default="b")
 
             if choice in {"b", "q"}:
                 return
@@ -678,6 +730,15 @@ class App:
                 latest_record = self.storage.get_invoice_by_number(int(invoice_record["invoice_number"]))
                 if latest_record is not None:
                     invoice_record = latest_record
+                continue
+
+            if choice == "v":
+                try:
+                    self._open_pdf(invoice_record.get("pdf_path", ""))
+                    self.console.print(Align.center(Panel("Opening PDF...", width=76, border_style="green")))
+                except Exception as error:
+                    self.console.print(Align.center(Panel(f"Failed to open PDF: {error}", width=76, border_style="red")))
+                self._pause()
                 continue
 
             timesheet = Timesheet(

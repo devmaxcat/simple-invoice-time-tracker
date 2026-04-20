@@ -9,6 +9,7 @@ class Settings:
         self.defaults = {
             "default_days_until_due": 7,
             "default_rate": 18.0,
+            "pdf_open_command": "xdg-open",
             "pdf_template_path": "storage/templates/invoice/Invoice.html",
             "pdf_date_format": "%m/%d/%Y",
             "client_name": "",

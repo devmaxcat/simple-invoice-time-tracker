@@ -202,6 +202,88 @@ class InvoiceGenerator:
 
         return link_pattern.sub(link_replacer, template_html)
 
+    def _parse_length_to_inches(self, value, default_inches=0.4):
+        if value is None:
+            return default_inches
+
+        text = str(value).strip().lower()
+        if not text:
+            return default_inches
+
+        try:
+            if text.endswith("in"):
+                return float(text[:-2])
+            if text.endswith("cm"):
+                return float(text[:-2]) / 2.54
+            if text.endswith("mm"):
+                return float(text[:-2]) / 25.4
+            if text.endswith("px"):
+                return float(text[:-2]) / 96.0
+            return float(text)
+        except ValueError:
+            return default_inches
+
+    def _page_width_inches(self, page_format):
+        widths = {
+            "letter": 8.5,
+            "legal": 8.5,
+            "tabloid": 11.0,
+            "ledger": 17.0,
+            "a0": 33.11,
+            "a1": 23.39,
+            "a2": 16.54,
+            "a3": 11.69,
+            "a4": 8.27,
+            "a5": 5.83,
+            "a6": 4.13,
+        }
+        return widths.get(str(page_format).strip().lower(), 8.27)
+
+    def _fit_scale_for_page_width(self, page, page_format, margin_left, margin_right):
+        content_width_px = page.evaluate(
+            """
+            () => {
+                const headerCells = Array.from(document.querySelectorAll('thead th.column-headers-background'));
+                if (headerCells.length > 0) {
+                    const sheetWidth = headerCells.reduce((sum, cell) => {
+                        const inline = parseFloat((cell.style && cell.style.width) || '0');
+                        const measured = cell.getBoundingClientRect().width || 0;
+                        const width = inline > 0 ? inline : measured;
+                        return sum + (Number.isFinite(width) ? width : 0);
+                    }, 0);
+                    if (sheetWidth > 0) {
+                        return sheetWidth;
+                    }
+                }
+
+                const waffleTable = document.querySelector('.waffle') || document.querySelector('table');
+                if (waffleTable) {
+                    const measured = waffleTable.getBoundingClientRect().width || waffleTable.scrollWidth || 0;
+                    if (measured > 0) {
+                        return measured;
+                    }
+                }
+
+                const body = document.body;
+                return (body && body.scrollWidth) ? body.scrollWidth : 1;
+            }
+            """
+        )
+
+        page_width_inches = self._page_width_inches(page_format)
+        left_inches = self._parse_length_to_inches(margin_left)
+        right_inches = self._parse_length_to_inches(margin_right)
+        printable_width_inches = max(1.0, page_width_inches - left_inches - right_inches)
+        printable_width_px = printable_width_inches * 96.0
+
+        content_width_px = float(content_width_px)
+        if content_width_px <= printable_width_px:
+            return 1.0
+
+        raw_scale = printable_width_px / content_width_px
+        clamped_scale = max(0.85, min(1.0, raw_scale))
+        return clamped_scale
+
     def _generate_from_html_template(self, template_path: Path, output_file: Path) -> Path:
         template_html = template_path.read_text(encoding="utf-8")
         template_html = re.sub(r"<meta[^>]*>", "", template_html, flags=re.IGNORECASE)
@@ -224,11 +306,13 @@ class InvoiceGenerator:
                 browser = playwright.chromium.launch()
                 page = browser.new_page()
                 page.goto(temp_html_path.as_uri(), wait_until="networkidle")
-                page.emulate_media(media="screen")
+                page.emulate_media(media="print")
+                fit_scale = self._fit_scale_for_page_width(page, page_format, margin_left, margin_right)
                 page.pdf(
                     path=str(output_file),
                     format=page_format,
                     print_background=True,
+                    scale=fit_scale,
                     margin={
                         "top": margin_top,
                         "right": margin_right,
