@@ -506,7 +506,6 @@ class App:
             "days_until_due": self.days_until_due,
             "due_date": self._serialize_date(self.due_date),
             "work_notes": self.work_notes,
-            "pdf_path": str(Path("invoices") / f"invoice_{invoice.invoice_number}.pdf"),
         }
 
     def _sorted_invoices(self):
@@ -642,7 +641,8 @@ class App:
 
         try:
             invoice_record = self._build_invoice_record(invoice)
-            generate_invoice(invoice, context=invoice_record, settings=self.settings)
+            pdf_path = generate_invoice(invoice, context=invoice_record, settings=self.settings)
+            invoice_record["pdf_path"] = str(pdf_path)
             self.storage.add_or_update_invoice(invoice_record)
             self.storage.invoices = self.storage.load_invoices()
             self.console.print(
@@ -755,7 +755,9 @@ class App:
             )
 
             try:
-                generate_invoice(invoice, context=invoice_record, settings=self.settings)
+                pdf_path = generate_invoice(invoice, context=invoice_record, settings=self.settings)
+                invoice_record["pdf_path"] = str(pdf_path)
+                self.storage.add_or_update_invoice(invoice_record)
                 self.console.print(Align.center(Panel("PDF regenerated successfully.", width=76, border_style="green")))
             except Exception as error:
                 self.console.print(Align.center(Panel(f"Failed to regenerate PDF: {error}", width=76, border_style="red")))

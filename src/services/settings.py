@@ -12,6 +12,7 @@ class Settings:
             "pdf_open_command": "xdg-open",
             "pdf_template_path": "storage/templates/invoice/Invoice.html",
             "pdf_date_format": "%m/%d/%Y",
+            "pdf_file_name_template": "invoice_{{ invoice_number }}",
             "client_name": "",
             "client_address_line1": "",
             "client_city": "",

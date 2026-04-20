@@ -23,10 +23,32 @@ class InvoiceGenerator:
         self.settings = settings if settings is not None else Settings()
         self.pdf = FPDF()
 
+    def _resolve_pdf_filename(self) -> str:
+        """Resolve the PDF filename from the configured template.
+
+        Substitutes {{ key }} placeholders using _build_template_data() values.
+        Falls back to 'invoice_{number}' if the template is empty.
+        """
+        template = str(self.settings.get("pdf_file_name_template", "invoice_{{ invoice_number }}")).strip()
+        if not template:
+            template = "invoice_{{ invoice_number }}"
+        data = self._build_template_data()
+
+        def _replacer(match):
+            key = match.group(1).strip()
+            value = str(data.get(key, match.group(0)))
+            # Sanitize for filesystem: keep alphanumerics, hyphens, underscores, dots
+            return re.sub(r"[^\w\-_.]", "_", value)
+
+        resolved = re.sub(r"\{\{\s*(\w+)\s*\}\}", _replacer, template)
+        # Collapse repeated underscores and strip leading/trailing unsafe chars
+        resolved = re.sub(r"_+", "_", resolved).strip("_. ")
+        return resolved or f"invoice_{self.invoice.invoice_number}"
+
     def generate_invoice(self, output_dir: str = "invoices") -> Path:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
-        invoice_file = output_path / f"invoice_{self.invoice.invoice_number}.pdf"
+        invoice_file = output_path / f"{self._resolve_pdf_filename()}.pdf"
 
         template_path = str(self.settings.get("pdf_template_path", "")).strip()
         if template_path:
@@ -327,13 +349,12 @@ class InvoiceGenerator:
         return output_file
 
 
-def generate_invoice(invoice: Invoice, context=None, settings=None) -> bool:
+def generate_invoice(invoice: Invoice, context=None, settings=None) -> Path:
     if invoice is None:
         raise InvoiceGenerationError("Invoice data is required.")
 
     try:
         generator = InvoiceGenerator(invoice, context=context, settings=settings)
-        generator.generate_invoice()
-        return True
+        return generator.generate_invoice()
     except Exception as exc:
         raise InvoiceGenerationError(f"Failed to generate invoice: {exc}") from exc
