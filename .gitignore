@@ -1,0 +1,5 @@
+storage/
+invoices/
+__pycache__/
+*.pyc
+.venv/
