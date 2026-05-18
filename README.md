@@ -6,6 +6,8 @@ A command line TUI application for timekeeping that generates invoices based on 
 
 - **Pay Period Selection**: Users can select their pay periods using arrow keys.
 - **Timesheet Entry**: Enter total hours worked with input validation.
+- **Edit Timesheet**: Enter daily clock-in/clock-out and optional lunch minutes for each day in the pay period; hours are calculated automatically.
+- **Optional Live Clocking**: For in-progress pay periods, use clock in/clock out and set lunch break minutes from the main invoice edit menu.
 - **Rate Management**: Adjust hourly rates, defaulting to $18.
 - **Date Management**: Set submission and due dates, with the submission date defaulting to today.
 - **Work Notes**: Enter freeform notes related to work done.
@@ -85,6 +87,12 @@ Main flow:
 - Use **Set Submitted Date** to set the submission date.
 - Use **Set Days Until Due** to control due date offset (defaults to **7** for new invoices).
 - Due date is always calculated as: **submitted date + days until due**.
+- Use **Set Hours** for direct total-hour entry, or **Edit Timesheet** to enter daily in/out/lunch and auto-calculate invoice hours.
+- In **Edit Timesheet**, use **↑ / ↓** to choose a day and **Enter** to edit that day quickly.
+- Timesheet edits are saved under the invoice `timesheet` key in `storage/invoices.json`, and total hours are recalculated when you finish editing.
+- When a pay period is currently in progress, the main invoice menu shows context-aware clock actions:
+   - if not clocked in: **Clock In (Now)**
+   - if clocked in: **Clock Out (Now)** and **Lunch Break**
 - In **Open Existing Invoice**, browse a table of saved invoices with **↑ / ↓**, then press **Enter**.
 - In that same invoice list, you can type an invoice number directly and press **Enter** as a shortcut.
 - In non-interactive/scripted runs, numeric and letter prompt input still works.

@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 import shlex
 import subprocess
@@ -38,6 +38,7 @@ class App:
         self.days_until_due = int(self.settings.get("default_days_until_due", 7))
         self.due_date = None
         self.work_notes = ""
+        self.timesheet_entries = []
         self.is_running = True
 
     def run(self):
@@ -178,26 +179,46 @@ class App:
         self.days_until_due = int(self.settings.get("default_days_until_due", 7))
         self.due_date = None
         self.work_notes = ""
+        self.timesheet_entries = self._default_timesheet_entries()
+        self._save_current_state_snapshot()
         self.edit_invoice_menu()
 
     def edit_invoice_menu(self):
         while True:
             period_start, period_end = self._current_period_range()
+            active_clock_entry = self._active_clocked_in_entry()
+            has_unsaved = self._has_unsaved_changes()
+            menu_actions = [
+                ("pay_period", "Select Pay Period"),
+                ("set_hours", "Set Hours"),
+                ("edit_timesheet", "Edit Timesheet"),
+            ]
+
+            if self._is_period_in_progress():
+                if active_clock_entry is None:
+                    menu_actions.append(("clock_in", "Clock In (Now)"))
+                else:
+                    menu_actions.append(("clock_out", "Clock Out (Now)"))
+                    menu_actions.append(("lunch_break", "Lunch Break"))
+
+            menu_actions.extend(
+                [
+                    ("set_rate", "Set Hourly Rate"),
+                    ("set_submission", "Set Submitted Date"),
+                    ("set_due_days", "Set Days Until Due"),
+                    ("work_notes", "Work Notes"),
+                    ("preview", "Preview Invoice"),
+                    ("save", "Save"),
+                    ("back", f"Back to Main Menu{' *unsaved*' if has_unsaved else ''}"),
+                ]
+            )
+            menu_labels = [label for _, label in menu_actions]
+
             if self._supports_arrow_navigation():
                 selected = self._arrow_menu_select(
                     menu_title="Invoice Menu",
                     summary_title="Current Draft",
-                    options=[
-                        "Select Pay Period",
-                        "Enter Hours Worked",
-                        "Set Hourly Rate",
-                        "Set Submitted Date",
-                        "Set Days Until Due",
-                        "Work Notes",
-                        "Preview Invoice",
-                        "Save",
-                        "Back to Main Menu",
-                    ],
+                    options=menu_labels,
                     summary_rows=[
                         ("Invoice #", str(self.current_invoice_number)),
                         ("Period Range", f"{format_date(period_start)} to {format_date(period_end)}"),
@@ -209,35 +230,68 @@ class App:
                         ("Days Until Due", str(self.days_until_due)),
                         ("Due", self._display_date(self.due_date)),
                     ],
-                    subtitle="↑/↓ navigate • Enter select • 1-9 quick select",
+                    subtitle="↑/↓ navigate • Enter select",
                 )
                 if selected == -1:
                     return
-                choice = str(selected + 1)
+                action = menu_actions[selected][0]
             else:
-                choice = Prompt.ask("Selection", choices=[str(i) for i in range(1, 10)])
+                choice = Prompt.ask("Selection", choices=[str(i) for i in range(1, len(menu_actions) + 1)])
+                action = menu_actions[int(choice) - 1][0]
 
-            if choice == "1":
+            if action == "pay_period":
                 self.show_pay_period_screen()
-            elif choice == "2":
+            elif action == "set_hours":
                 self.show_timesheet_entry_screen()
-            elif choice == "3":
+            elif action == "edit_timesheet":
+                self.show_fill_timesheet_screen()
+            elif action == "clock_in":
+                self._clock_in_now()
+                self._pause()
+            elif action == "clock_out":
+                self._clock_out_now()
+                self._pause()
+            elif action == "lunch_break":
+                self._set_active_lunch_break()
+                self._pause()
+            elif action == "set_rate":
                 self.show_rates_screen()
-            elif choice == "4":
+            elif action == "set_submission":
                 self.show_submission_date_screen()
-            elif choice == "5":
+            elif action == "set_due_days":
                 self.show_days_until_due_screen()
-            elif choice == "6":
+            elif action == "work_notes":
                 self.show_work_notes_screen()
-            elif choice == "7":
+            elif action == "preview":
                 self.show_invoice_preview_screen()
-            elif choice == "8":
+            elif action == "save":
                 did_save = self.generate_and_save_invoice()
                 if did_save:
                     self.open_existing_invoice()
                     return
-            elif choice == "9":
-                return
+            elif action == "back":
+                if self._has_unsaved_changes():
+                    self.console.clear()
+                    self._screen_header("Unsaved Changes", content_lines=10)
+                    self.console.print(
+                        Align.center(
+                            Panel(
+                                "You have unsaved changes.",
+                                width=76,
+                                border_style="yellow",
+                                box=box.ROUNDED,
+                            )
+                        )
+                    )
+                    choice = Prompt.ask("[S]ave and exit • [D]iscard changes • [C]ancel", choices=["s", "d", "c"], default="c")
+                    if choice == "s":
+                        did_save = self.generate_and_save_invoice()
+                        if did_save:
+                            return
+                    elif choice == "d":
+                        return
+                else:
+                    return
 
     def _pause(self):
         Prompt.ask("Press Enter to continue", default="")
@@ -303,9 +357,12 @@ class App:
             self.submission_date = period_end
             self.due_date = self.submission_date + timedelta(days=self.days_until_due)
 
+        self.timesheet_entries = self._normalize_timesheet_entries(self.timesheet_entries)
+        self._recalculate_hours_from_timesheet()
+
     def show_timesheet_entry_screen(self):
         self.console.clear()
-        self._screen_header("Enter Hours Worked")
+        self._screen_header("Set Hours")
         while True:
             raw_value = Prompt.ask("Hours worked (q to cancel)", default=f"{self.hours_worked:.2f}")
             if raw_value.strip().lower() == "q":
@@ -318,6 +375,411 @@ class App:
                 break
             except ValueError:
                 self.console.print("Please enter a valid non-negative number.", style="bold red")
+
+    def _period_dates(self):
+        period_start, period_end = self._current_period_range()
+        dates = []
+        current = period_start
+        while current <= period_end:
+            dates.append(current)
+            current += timedelta(days=1)
+        return dates
+
+    def _default_timesheet_entries(self):
+        entries = []
+        for day in self._period_dates():
+            entries.append(
+                {
+                    "date": format_date(day),
+                    "clock_in": "",
+                    "clock_out": "",
+                    "lunch_minutes": 0,
+                    "hours": 0.0,
+                }
+            )
+        return entries
+
+    def _normalize_timesheet_entries(self, raw_entries):
+        by_date = {}
+        if isinstance(raw_entries, list):
+            for raw_entry in raw_entries:
+                if not isinstance(raw_entry, dict):
+                    continue
+                date_text = str(raw_entry.get("date", "")).strip()
+                if not is_valid_date(date_text):
+                    continue
+                by_date[date_text] = {
+                    "date": date_text,
+                    "clock_in": str(raw_entry.get("clock_in", "")).strip(),
+                    "clock_out": str(raw_entry.get("clock_out", "")).strip(),
+                    "lunch_minutes": self._safe_non_negative_int(raw_entry.get("lunch_minutes", 0)),
+                    "hours": float(raw_entry.get("hours", 0.0) or 0.0),
+                }
+
+        normalized = []
+        for day in self._period_dates():
+            date_text = format_date(day)
+            entry = by_date.get(
+                date_text,
+                {
+                    "date": date_text,
+                    "clock_in": "",
+                    "clock_out": "",
+                    "lunch_minutes": 0,
+                    "hours": 0.0,
+                },
+            )
+            entry["hours"] = self._calculate_entry_hours(
+                entry.get("clock_in", ""),
+                entry.get("clock_out", ""),
+                int(entry.get("lunch_minutes", 0)),
+            )
+            normalized.append(entry)
+        return normalized
+
+    def _safe_non_negative_int(self, value):
+        try:
+            parsed = int(value)
+            if parsed < 0:
+                return 0
+            return parsed
+        except (TypeError, ValueError):
+            return 0
+
+    def _parse_time_value(self, time_text):
+        try:
+            return datetime.strptime(time_text, "%H:%M")
+        except ValueError:
+            return None
+
+    def _calculate_entry_hours(self, clock_in_text, clock_out_text, lunch_minutes):
+        clock_in = self._parse_time_value(str(clock_in_text).strip())
+        clock_out = self._parse_time_value(str(clock_out_text).strip())
+        if clock_in is None or clock_out is None:
+            return 0.0
+
+        minutes_worked = int((clock_out - clock_in).total_seconds() // 60)
+        if minutes_worked <= 0:
+            return 0.0
+
+        net_minutes = max(0, minutes_worked - max(0, int(lunch_minutes)))
+        return round(net_minutes / 60.0, 2)
+
+    def _recalculate_hours_from_timesheet(self):
+        self.timesheet_entries = self._normalize_timesheet_entries(self.timesheet_entries)
+        self.hours_worked = round(sum(entry.get("hours", 0.0) for entry in self.timesheet_entries), 2)
+
+    def _is_period_in_progress(self):
+        today = get_today_date()
+        period_start, period_end = self._current_period_range()
+        return period_start <= today <= period_end
+
+    def _active_clocked_in_entry(self):
+        for entry in self.timesheet_entries:
+            if entry.get("clock_in") and not entry.get("clock_out"):
+                return entry
+        return None
+
+    def _save_current_state_snapshot(self):
+        """Capture current invoice state for change detection."""
+        self._state_snapshot = {
+            "hours_worked": self.hours_worked,
+            "hourly_rate": self.hourly_rate,
+            "submission_date": self._serialize_date(self.submission_date),
+            "days_until_due": self.days_until_due,
+            "due_date": self._serialize_date(self.due_date),
+            "work_notes": self.work_notes,
+            "pay_period_start_date": format_date(self.pay_period_start_date),
+            "pay_period_length_days": self.pay_period_length_days,
+            "timesheet": [dict(entry) for entry in self.timesheet_entries],
+        }
+
+    def _has_unsaved_changes(self):
+        """Check if current state differs from snapshot."""
+        if not hasattr(self, "_state_snapshot"):
+            return False
+        current_state = {
+            "hours_worked": self.hours_worked,
+            "hourly_rate": self.hourly_rate,
+            "submission_date": self._serialize_date(self.submission_date),
+            "days_until_due": self.days_until_due,
+            "due_date": self._serialize_date(self.due_date),
+            "work_notes": self.work_notes,
+            "pay_period_start_date": format_date(self.pay_period_start_date),
+            "pay_period_length_days": self.pay_period_length_days,
+            "timesheet": [dict(entry) for entry in self.timesheet_entries],
+        }
+        return current_state != self._state_snapshot
+
+    def _timesheet_table(self, selected_index=None):
+        table = Table(box=box.SIMPLE_HEAVY, expand=False)
+        table.add_column("#", justify="right", style="bold")
+        table.add_column("Date", style="white")
+        table.add_column("In", justify="center", style="cyan")
+        table.add_column("Out", justify="center", style="cyan")
+        table.add_column("Lunch", justify="right", style="magenta")
+        table.add_column("Hours", justify="right", style="bold green")
+
+        for index, entry in enumerate(self.timesheet_entries, start=1):
+            is_selected = selected_index is not None and (index - 1) == selected_index
+            index_text = str(index)
+            date_text = str(entry.get("date", ""))
+            in_text = str(entry.get("clock_in", "") or "-")
+            out_text = str(entry.get("clock_out", "") or "-")
+            lunch_text = str(entry.get("lunch_minutes", 0))
+            hours_text = f"{float(entry.get('hours', 0.0)):.2f}"
+            if is_selected:
+                index_text = f"[black on cyan]{index_text}[/black on cyan]"
+                date_text = f"[black on cyan]{date_text}[/black on cyan]"
+                in_text = f"[black on cyan]{in_text}[/black on cyan]"
+                out_text = f"[black on cyan]{out_text}[/black on cyan]"
+                lunch_text = f"[black on cyan]{lunch_text}[/black on cyan]"
+                hours_text = f"[black on cyan]{hours_text}[/black on cyan]"
+            table.add_row(
+                index_text,
+                date_text,
+                in_text,
+                out_text,
+                lunch_text,
+                hours_text,
+            )
+        return table
+
+    def _prompt_time_or_blank(self, label, default_value=""):
+        while True:
+            value = Prompt.ask(label, default=default_value)
+            trimmed = value.strip()
+            if trimmed.lower() == "q":
+                return None, True
+            if trimmed == "":
+                return "", False
+            if self._parse_time_value(trimmed) is not None:
+                return trimmed, False
+            self.console.print("Time must use 24-hour format HH:MM.", style="bold red")
+
+    def _edit_timesheet_day_by_index(self, index):
+        if index < 0 or index >= len(self.timesheet_entries):
+            return
+        entry = self.timesheet_entries[index]
+        self.console.print(f"Editing {entry['date']}", style="bold cyan")
+
+        clock_in_text, did_cancel = self._prompt_time_or_blank("Clock in (HH:MM, blank to clear, q to cancel)", entry.get("clock_in", ""))
+        if did_cancel:
+            return
+
+        clock_out_text, did_cancel = self._prompt_time_or_blank("Clock out (HH:MM, blank to clear, q to cancel)", entry.get("clock_out", ""))
+        if did_cancel:
+            return
+
+        lunch_default = str(entry.get("lunch_minutes", 0))
+        while True:
+            lunch_input = Prompt.ask("Lunch minutes (q to cancel)", default=lunch_default)
+            if lunch_input.strip().lower() == "q":
+                return
+            try:
+                lunch_minutes = int(lunch_input)
+                if lunch_minutes < 0:
+                    raise ValueError
+                break
+            except ValueError:
+                self.console.print("Lunch minutes must be a non-negative integer.", style="bold red")
+
+        if clock_out_text and not clock_in_text:
+            self.console.print("Cannot set clock out without clock in.", style="bold red")
+            return
+
+        calculated_hours = self._calculate_entry_hours(clock_in_text, clock_out_text, lunch_minutes)
+        if clock_in_text and clock_out_text and calculated_hours <= 0:
+            self.console.print("Clock out must be later than clock in.", style="bold red")
+            return
+
+        entry["clock_in"] = clock_in_text
+        entry["clock_out"] = clock_out_text
+        entry["lunch_minutes"] = lunch_minutes
+        entry["hours"] = calculated_hours
+        self._recalculate_hours_from_timesheet()
+
+    def _clear_timesheet_day_by_index(self, index):
+        if index < 0 or index >= len(self.timesheet_entries):
+            return
+        self.timesheet_entries[index]["clock_in"] = ""
+        self.timesheet_entries[index]["clock_out"] = ""
+        self.timesheet_entries[index]["lunch_minutes"] = 0
+        self.timesheet_entries[index]["hours"] = 0.0
+        self._recalculate_hours_from_timesheet()
+
+    def _clock_in_now(self):
+        if not self._is_period_in_progress():
+            self.console.print("Clock in is only available during an in-progress pay period.", style="bold yellow")
+            return
+
+        if self._active_clocked_in_entry() is not None:
+            self.console.print("Already clocked in. Clock out first.", style="bold yellow")
+            return
+
+        today_text = format_date(get_today_date())
+        target_entry = next((entry for entry in self.timesheet_entries if entry.get("date") == today_text), None)
+        if target_entry is None:
+            self.console.print("Today is outside this pay period.", style="bold yellow")
+            return
+
+        target_entry["clock_in"] = datetime.now().strftime("%H:%M")
+        target_entry["clock_out"] = ""
+        target_entry["hours"] = 0.0
+        self.console.print(f"Clocked in at {target_entry['clock_in']} for {today_text}.", style="bold green")
+
+    def _clock_out_now(self):
+        active_entry = self._active_clocked_in_entry()
+        if active_entry is None:
+            self.console.print("No active clock-in found.", style="bold yellow")
+            return
+
+        active_entry["clock_out"] = datetime.now().strftime("%H:%M")
+        lunch_minutes = int(active_entry.get("lunch_minutes", 0))
+        calculated_hours = self._calculate_entry_hours(
+            active_entry.get("clock_in", ""),
+            active_entry.get("clock_out", ""),
+            lunch_minutes,
+        )
+        if calculated_hours <= 0:
+            active_entry["clock_out"] = ""
+            self.console.print("Clock out must be later than clock in.", style="bold red")
+            return
+
+        active_entry["hours"] = calculated_hours
+        self._recalculate_hours_from_timesheet()
+        self.console.print(
+            f"Clocked out at {active_entry['clock_out']} ({calculated_hours:.2f}h).",
+            style="bold green",
+        )
+
+    def _set_active_lunch_break(self):
+        active_entry = self._active_clocked_in_entry()
+        if active_entry is None:
+            self.console.print("No active clock-in found.", style="bold yellow")
+            return
+
+        while True:
+            lunch_input = Prompt.ask("Lunch break minutes (q to cancel)", default=str(active_entry.get("lunch_minutes", 0)))
+            if lunch_input.strip().lower() == "q":
+                return
+            try:
+                lunch_minutes = int(lunch_input)
+                if lunch_minutes < 0:
+                    raise ValueError
+                active_entry["lunch_minutes"] = lunch_minutes
+                self.console.print("Lunch break updated.", style="bold green")
+                return
+            except ValueError:
+                self.console.print("Lunch minutes must be a non-negative integer.", style="bold red")
+
+    def show_fill_timesheet_screen(self):
+        self.timesheet_entries = self._normalize_timesheet_entries(self.timesheet_entries)
+        selected_index = 0
+        while True:
+            self.console.clear()
+            self._screen_header("Edit Timesheet", content_lines=18)
+
+            period_start, period_end = self._current_period_range()
+            self.console.print(
+                Align.center(
+                    Panel(
+                        f"Pay Period: {format_date(period_start)} to {format_date(period_end)}",
+                        width=92,
+                        border_style="cyan",
+                        box=box.ROUNDED,
+                    )
+                )
+            )
+
+            if self._is_period_in_progress():
+                self.console.print(
+                    Align.center(
+                        Panel(
+                            "WARNING: This pay period is in progress.",
+                            width=92,
+                            border_style="yellow",
+                            box=box.ROUNDED,
+                        )
+                    )
+                )
+
+            active_entry = self._active_clocked_in_entry()
+            if active_entry is not None:
+                self.console.print(
+                    Align.center(
+                        Panel(
+                            f"Clocked in on {active_entry['date']} at {active_entry['clock_in']}",
+                            width=92,
+                            border_style="magenta",
+                            box=box.ROUNDED,
+                        )
+                    )
+                )
+
+            self.console.print(Align.center(Panel(self._timesheet_table(selected_index), width=92, border_style="green", box=box.ROUNDED)))
+            self.console.print(Align.center(Panel(f"Calculated Hours: {self.hours_worked:.2f}", width=92, border_style="bright_green", box=box.SIMPLE)))
+
+            if self._supports_arrow_navigation():
+                controls_text = "↑/↓ select day • Enter edit • d clear day • q done"
+                self.console.print(Align.center(Panel(controls_text, width=92, border_style="cyan", box=box.SIMPLE)))
+                key = self._read_key()
+                if key == "UP":
+                    selected_index = (selected_index - 1) % len(self.timesheet_entries)
+                    continue
+                if key == "DOWN":
+                    selected_index = (selected_index + 1) % len(self.timesheet_entries)
+                    continue
+                if key == "ENTER":
+                    self._edit_timesheet_day_by_index(selected_index)
+                    continue
+                if key.lower() == "d":
+                    self._clear_timesheet_day_by_index(selected_index)
+                    continue
+                if key.lower() == "q":
+                    self._recalculate_hours_from_timesheet()
+                    return
+                continue
+
+            self.console.print(Align.center(Panel("[E]dit day  [C]lear day  [D]one", width=92, border_style="cyan", box=box.SIMPLE)))
+            choice = Prompt.ask("Action", choices=["e", "c", "d", "q"], default="d")
+            if choice in {"d", "q"}:
+                self._recalculate_hours_from_timesheet()
+                return
+            if choice == "e":
+                while True:
+                    day_input = Prompt.ask(
+                        f"Day number (1-{len(self.timesheet_entries)}, q to cancel)",
+                        default=str(selected_index + 1),
+                    )
+                    if day_input.strip().lower() == "q":
+                        break
+                    try:
+                        parsed_index = int(day_input) - 1
+                        if 0 <= parsed_index < len(self.timesheet_entries):
+                            selected_index = parsed_index
+                            self._edit_timesheet_day_by_index(selected_index)
+                            break
+                    except ValueError:
+                        pass
+                    self.console.print("Please enter a valid day number.", style="bold red")
+            if choice == "c":
+                while True:
+                    day_input = Prompt.ask(
+                        f"Day number to clear (1-{len(self.timesheet_entries)}, q to cancel)",
+                        default=str(selected_index + 1),
+                    )
+                    if day_input.strip().lower() == "q":
+                        break
+                    try:
+                        parsed_index = int(day_input) - 1
+                        if 0 <= parsed_index < len(self.timesheet_entries):
+                            selected_index = parsed_index
+                            self._clear_timesheet_day_by_index(selected_index)
+                            break
+                    except ValueError:
+                        pass
+                    self.console.print("Please enter a valid day number.", style="bold red")
 
     def show_rates_screen(self):
         self.console.clear()
@@ -454,6 +916,9 @@ class App:
                 self.due_date = None
 
         self.work_notes = str(invoice_record.get("work_notes", ""))
+        self.timesheet_entries = self._normalize_timesheet_entries(invoice_record.get("timesheet", []))
+        self._recalculate_hours_from_timesheet()
+        self._save_current_state_snapshot()
 
     def _build_invoice(self):
         timesheet = Timesheet(
@@ -463,6 +928,7 @@ class App:
             due_date=self._serialize_date(self.due_date),
             work_notes=self.work_notes,
         )
+        setattr(timesheet, "entries", self._normalize_timesheet_entries(self.timesheet_entries))
         return Invoice(
             invoice_number=self.current_invoice_number,
             total_amount=timesheet.calculate_total(),
@@ -506,10 +972,11 @@ class App:
             "days_until_due": self.days_until_due,
             "due_date": self._serialize_date(self.due_date),
             "work_notes": self.work_notes,
+            "timesheet": self._normalize_timesheet_entries(self.timesheet_entries),
         }
 
     def _sorted_invoices(self):
-        return sorted(self.storage.invoices, key=lambda item: int(item.get("invoice_number", 0)))
+        return sorted(self.storage.invoices, key=lambda item: int(item.get("invoice_number", 0)), reverse=True)
 
     def _invoice_list_table(self, invoices, selected_index=None):
         table = Table(box=box.SIMPLE_HEAVY, expand=False)
